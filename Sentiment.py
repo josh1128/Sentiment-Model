@@ -1,24 +1,29 @@
 """
-LSEG News Sentiment Analysis — Streamlit Application.
+LSEG News Sentiment Analysis — Streamlit application.
 
-Retrieves news headlines and full stories from LSEG Workspace via the
-LSEG Data Library for Python (`lseg.data`), analyzes sentiment with
-TextBlob, and presents interactive metrics, charts, and tables.
+Follows the structure of the LSEG Developer Portal article
+"Introduction to News Sentiment Analysis with Eikon Data APIs - a Python
+example", ported to the LSEG Data Library for Python (lseg.data):
 
-Prerequisites:
-    - LSEG Workspace desktop application running and logged in.
-    - `lseg-data` installed and (optionally) an app key configured in
-      `.streamlit/secrets.toml` (see `.streamlit/secrets.toml.example`).
+    1. Get headlines into a dataframe   -> ld.news.get_headlines()
+    2. Add Polarity / Subjectivity / Score columns
+    3. Loop over storyId, fetch story   -> ld.news.get_story()
+       clean with BeautifulSoup, score with TextBlob,
+       bucket into positive / neutral / negative
+    4. (Optional) Get minute price bars -> ld.get_history()
+       and compute t+2m / t+5m / t+10m / t+30m returns per news item,
+       then group mean returns by Score bucket
 
-Run with:
-    streamlit run app.py
+Requires a running, logged-in LSEG Workspace desktop session.
+Run with: streamlit run app.py
 """
 
 from __future__ import annotations
 
+import datetime
 import logging
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from typing import Any, Optional
 
 import numpy as np
@@ -30,29 +35,31 @@ from textblob import TextBlob
 
 try:
     import lseg.data as ld
-except ImportError:  # pragma: no cover - handled gracefully in the UI
+except ImportError:  # pragma: no cover - handled in the UI
     ld = None  # type: ignore[assignment]
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("lseg_sentiment_app")
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
 STORY_REQUEST_DELAY_SECONDS: float = 0.35
-HEADLINES_CACHE_TTL_SECONDS: int = 600  # 10 minutes
+HEADLINES_CACHE_TTL_SECONDS: int = 600
 MAX_HEADLINES_LIMIT: int = 100
-SENTIMENT_ORDER: list[str] = ["Positive", "Neutral", "Negative"]
-SENTIMENT_COLORS: dict[str, str] = {
-    "Positive": "#2E8B57",
-    "Neutral": "#8C8C8C",
-    "Negative": "#C0392B",
+SCORE_ORDER: list[str] = ["positive", "neutral", "negative"]
+SCORE_COLORS: dict[str, str] = {
+    "positive": "#2E8B57",
+    "neutral": "#8C8C8C",
+    "negative": "#C0392B",
 }
+RETURN_HORIZONS_MIN: list[tuple[str, int]] = [
+    ("twoM", 2),
+    ("fiveM", 5),
+    ("tenM", 10),
+    ("thirtyM", 30),
+]
 
 
 # ---------------------------------------------------------------------------
-# LSEG session and data retrieval
+# Session handling
 # ---------------------------------------------------------------------------
 
 @st.cache_resource(show_spinner="Opening LSEG Workspace session...")
@@ -60,19 +67,11 @@ def get_lseg_session() -> Any:
     """
     Open (and cache) a single LSEG Workspace desktop session.
 
-    The session is cached with ``st.cache_resource`` so it is created once
-    per Streamlit server process and reused across reruns and users.
-
-    An app key is read from Streamlit secrets if present
-    (``[lseg] app_key = "..."``); otherwise the library falls back to its
-    standard configuration (e.g. ``lseg-data.config.json``).
-
     Returns:
         The opened LSEG session object.
 
     Raises:
-        RuntimeError: If the ``lseg-data`` package is not installed or the
-            session cannot be opened (e.g. Workspace is not running).
+        RuntimeError: If lseg-data is missing or the session cannot open.
     """
     if ld is None:
         raise RuntimeError(
@@ -84,304 +83,304 @@ def get_lseg_session() -> Any:
     try:
         app_key = st.secrets.get("lseg", {}).get("app_key")  # type: ignore[union-attr]
     except Exception:
-        # No secrets file present — that is fine for a desktop session.
         app_key = None
 
     try:
         if app_key:
             session = ld.session.desktop.Definition(app_key=app_key).get_session()
             session.open()
-            ld.session.set_default(session)
         else:
             session = ld.open_session()
+        if session is None:
+            raise RuntimeError("open_session() returned None.")
+        ld.session.set_default(session)
     except Exception as exc:
         raise RuntimeError(
             "Could not open an LSEG Workspace session. Make sure the LSEG "
             "Workspace desktop application is running and you are logged in. "
             f"Underlying error: {exc}"
         ) from exc
-
     return session
 
 
+def ensure_session_open() -> Any:
+    """
+    Return an OPEN LSEG session, rebuilding the cached one if it went stale.
+
+    Returns:
+        An open LSEG session object.
+
+    Raises:
+        RuntimeError: If a session cannot be (re)opened.
+    """
+    session = get_lseg_session()
+    is_open = False
+    try:
+        state = getattr(session, "open_state", None)
+        is_open = state is not None and str(state).lower().endswith("opened")
+    except Exception:
+        is_open = False
+
+    if not is_open:
+        logger.warning("Cached LSEG session is not open; rebuilding it.")
+        try:
+            session.close()
+        except Exception:
+            pass
+        get_lseg_session.clear()
+        session = get_lseg_session()
+
+    ld.session.set_default(session)
+    return session
+
+
+# ---------------------------------------------------------------------------
+# Step 1 — headlines dataframe (article's In [2])
+# ---------------------------------------------------------------------------
+
 @st.cache_data(ttl=HEADLINES_CACHE_TTL_SECONDS, show_spinner="Fetching headlines...")
-def fetch_headlines(
+def get_headlines_df(
     query: str,
     start_date_iso: str,
     end_date_iso: str,
-    max_headlines: int,
+    count: int,
 ) -> pd.DataFrame:
     """
-    Retrieve news headlines from LSEG for a query and date range.
-
-    Results are cached with ``st.cache_data`` (TTL: 10 minutes) keyed by the
-    function arguments, so identical requests within the TTL do not hit the
-    LSEG API again.
+    Retrieve headlines into a dataframe with columns
+    ``versionCreated``, ``text``, ``storyId`` (article-style layout).
 
     Args:
-        query: LSEG news query string (e.g. ``'"Goldman Sachs" and Language:LEN'``).
-        start_date_iso: Inclusive start date, ISO format ``YYYY-MM-DD``.
-        end_date_iso: Inclusive end date, ISO format ``YYYY-MM-DD``.
-        max_headlines: Maximum number of headlines to retrieve (1–100).
+        query: LSEG news query, e.g. 'R:GS.N AND Language:LEN'.
+        start_date_iso: Start date, YYYY-MM-DD.
+        end_date_iso: End date, YYYY-MM-DD.
+        count: Number of headlines to retrieve (1-100).
 
     Returns:
-        A DataFrame with (at minimum) columns ``headline``, ``storyId`` and
-        ``versionCreated``. May be empty if no news is found.
+        Headlines dataframe (possibly empty).
 
     Raises:
-        RuntimeError: If the LSEG API call fails.
+        RuntimeError: If the API call fails or the shape is unexpected.
     """
-    # Ensure a session exists (cached, so effectively a no-op after first call).
-    get_lseg_session()
-
+    ensure_session_open()
     try:
-        raw = ld.news.get_headlines(
-            query,
-            start=start_date_iso,
-            end=end_date_iso,
-            count=max_headlines,
+        df = ld.news.get_headlines(
+            query, start=start_date_iso, end=end_date_iso, count=count
         )
     except Exception as exc:
         raise RuntimeError(f"Failed to retrieve headlines from LSEG: {exc}") from exc
 
-    if raw is None or len(raw) == 0:
-        return pd.DataFrame(columns=["headline", "storyId", "versionCreated"])
+    if df is None or len(df) == 0:
+        return pd.DataFrame(columns=["versionCreated", "text", "storyId"])
 
-    df = raw.copy()
-
-    # The publication timestamp is usually the index ("versionCreated").
+    df = df.copy()
+    # In lseg.data the timestamp is the index and the headline column is
+    # named 'headline'; normalize to the article's 'text' convention.
+    df = df.reset_index()
+    rename_map: dict[str, str] = {}
+    if "headline" in df.columns:
+        rename_map["headline"] = "text"
     if "versionCreated" not in df.columns:
-        df = df.reset_index()
-        if "versionCreated" not in df.columns and len(df.columns) > 0:
-            # Fall back: assume the former index column holds the timestamp.
-            df = df.rename(columns={df.columns[0]: "versionCreated"})
-    else:
-        df = df.reset_index(drop=True)
+        rename_map[df.columns[0]] = "versionCreated"
+    df = df.rename(columns=rename_map)
 
-    # Normalize expected column names defensively.
-    if "headline" not in df.columns:
-        for candidate in ("text", "title", "Headline"):
-            if candidate in df.columns:
-                df = df.rename(columns={candidate: "headline"})
-                break
-
-    required = {"headline", "storyId"}
-    missing = required - set(df.columns)
+    missing = {"text", "storyId", "versionCreated"} - set(df.columns)
     if missing:
-        raise RuntimeError(
-            f"Unexpected headlines response from LSEG; missing columns: {sorted(missing)}"
-        )
+        raise RuntimeError(f"Unexpected headlines response; missing: {sorted(missing)}")
 
     df["versionCreated"] = pd.to_datetime(df["versionCreated"], errors="coerce", utc=True)
-    return df[["headline", "storyId", "versionCreated"]]
-
-
-def fetch_story(story_id: str) -> str:
-    """
-    Retrieve the full news story (HTML) for a given story ID.
-
-    Args:
-        story_id: The LSEG story identifier from a headlines result.
-
-    Returns:
-        The raw story content (typically HTML).
-
-    Raises:
-        RuntimeError: If the story cannot be retrieved.
-    """
-    try:
-        story = ld.news.get_story(story_id)
-    except Exception as exc:
-        raise RuntimeError(f"get_story failed for '{story_id}': {exc}") from exc
-
-    if story is None:
-        raise RuntimeError(f"get_story returned no content for '{story_id}'.")
-
-    return str(story)
+    return df[["versionCreated", "text", "storyId"]]
 
 
 # ---------------------------------------------------------------------------
-# Text processing and sentiment
+# Step 2 + 3 — sentiment loop (article's In [3] and In [4])
 # ---------------------------------------------------------------------------
 
-def clean_html(raw_html: str) -> str:
+def classify_score(polarity: float, pos_threshold: float, neg_threshold: float) -> str:
     """
-    Strip HTML tags and normalize whitespace from article content.
+    Bucket a polarity into 'positive' / 'neutral' / 'negative'.
+
+    Mirrors the article's logic (>= 0.05 positive, <= -0.05 negative by
+    default) but with user-configurable thresholds.
 
     Args:
-        raw_html: Raw (possibly HTML) article content.
+        polarity: TextBlob polarity in [-1, 1].
+        pos_threshold: Polarity at or above which the score is positive.
+        neg_threshold: Polarity at or below which the score is negative.
 
     Returns:
-        Plain text with tags removed and whitespace collapsed.
+        One of 'positive', 'neutral', 'negative'.
     """
-    if not raw_html:
-        return ""
-    try:
-        soup = BeautifulSoup(raw_html, "lxml")
-        text = soup.get_text(separator=" ")
-    except Exception:
-        # If parsing fails for any reason, fall back to the raw string.
-        text = raw_html
-    return " ".join(text.split()).strip()
+    if polarity >= pos_threshold:
+        return "positive"
+    if polarity <= neg_threshold:
+        return "negative"
+    return "neutral"
 
 
-def classify_sentiment(
-    polarity: float,
-    positive_threshold: float,
-    negative_threshold: float,
-) -> str:
-    """
-    Map a polarity score to a sentiment label using user thresholds.
-
-    Args:
-        polarity: TextBlob polarity in [-1.0, 1.0].
-        positive_threshold: Polarity at or above which text is Positive.
-        negative_threshold: Polarity at or below which text is Negative.
-
-    Returns:
-        One of ``"Positive"``, ``"Neutral"``, ``"Negative"``.
-    """
-    if polarity >= positive_threshold:
-        return "Positive"
-    if polarity <= negative_threshold:
-        return "Negative"
-    return "Neutral"
-
-
-def analyze_text(
-    text: str,
-    positive_threshold: float,
-    negative_threshold: float,
-) -> tuple[float, float, str]:
-    """
-    Compute TextBlob polarity, subjectivity, and a sentiment label.
-
-    Args:
-        text: The plain text to analyze.
-        positive_threshold: Polarity threshold for the Positive label.
-        negative_threshold: Polarity threshold for the Negative label.
-
-    Returns:
-        Tuple ``(polarity, subjectivity, sentiment_label)``.
-    """
-    blob = TextBlob(text)
-    polarity = float(blob.sentiment.polarity)
-    subjectivity = float(blob.sentiment.subjectivity)
-    label = classify_sentiment(polarity, positive_threshold, negative_threshold)
-    return polarity, subjectivity, label
-
-
-# ---------------------------------------------------------------------------
-# Analysis pipeline
-# ---------------------------------------------------------------------------
-
-def run_sentiment_analysis(
-    headlines_df: pd.DataFrame,
-    positive_threshold: float,
-    negative_threshold: float,
+def score_sentiment(
+    df: pd.DataFrame,
+    pos_threshold: float,
+    neg_threshold: float,
     progress_callback: Optional[Any] = None,
 ) -> pd.DataFrame:
     """
-    Fetch full stories for each headline and compute sentiment metrics.
+    Iterate over the headlines dataframe, fetch each story, clean HTML,
+    score sentiment with TextBlob, and write Polarity / Subjectivity /
+    Score / storyText / error columns back onto the dataframe — exactly
+    the article's In [4] loop, hardened for production.
 
-    For each headline: the full story is retrieved via ``ld.news.get_story``
-    and cleaned; if retrieval fails, the headline text is used as a fallback
-    and the error is recorded — a single failure never aborts the run.
-    A small delay is inserted between story requests to avoid API bursts.
+    If a story fetch fails, the headline text is used as a fallback and
+    the error is recorded; one failed article never stops the run.
 
     Args:
-        headlines_df: DataFrame with ``headline``, ``storyId``, ``versionCreated``.
-        positive_threshold: Polarity threshold for the Positive label.
-        negative_threshold: Polarity threshold for the Negative label.
-        progress_callback: Optional callable accepting ``(fraction, message)``
-            for progress reporting (e.g. from a Streamlit progress bar).
+        df: Headlines dataframe (versionCreated, text, storyId).
+        pos_threshold: Positive polarity threshold.
+        neg_threshold: Negative polarity threshold.
+        progress_callback: Optional callable (fraction, message).
 
     Returns:
-        DataFrame with columns: ``headline``, ``published``, ``sentiment``,
-        ``polarity``, ``subjectivity``, ``story_text``, ``used_fallback``,
-        ``error``.
+        The dataframe with added sentiment columns.
     """
-    records: list[dict[str, Any]] = []
-    total = len(headlines_df)
+    df = df.copy()
+    df["Polarity"] = np.nan
+    df["Subjectivity"] = np.nan
+    df["Score"] = ""
+    df["storyText"] = ""
+    df["error"] = ""
 
-    for i, row in enumerate(headlines_df.itertuples(index=False)):
-        headline: str = str(getattr(row, "headline", "") or "")
-        story_id: str = str(getattr(row, "storyId", "") or "")
-        published = getattr(row, "versionCreated", pd.NaT)
+    total = len(df)
+    for idx, story_id in enumerate(df["storyId"].values):  # for each row
+        news_text = ""
+        try:
+            ensure_session_open()
+            news_text = ld.news.get_story(str(story_id))  # get the news story
+        except Exception as exc:
+            df.iloc[idx, df.columns.get_loc("error")] = str(exc)
+            logger.warning("get_story failed for %s: %s", story_id, exc)
 
-        story_text = ""
-        error_message = ""
-        used_fallback = False
+        if news_text:
+            soup = BeautifulSoup(str(news_text), "lxml")  # strip HTML
+            plain_text = " ".join(soup.get_text(separator=" ").split())
+        else:
+            plain_text = str(df["text"].iloc[idx])  # headline fallback
 
         try:
-            raw_story = fetch_story(story_id)
-            story_text = clean_html(raw_story)
-            if not story_text:
-                raise RuntimeError("Story content was empty after HTML cleaning.")
-        except Exception as exc:
-            error_message = str(exc)
-            used_fallback = True
-            story_text = headline
-            logger.warning("Falling back to headline for %s: %s", story_id, exc)
-
-        try:
-            polarity, subjectivity, label = analyze_text(
-                story_text, positive_threshold, negative_threshold
+            sent_a = TextBlob(plain_text)  # analyse text
+            polarity = float(sent_a.sentiment.polarity)
+            subjectivity = float(sent_a.sentiment.subjectivity)
+            df.iloc[idx, df.columns.get_loc("Polarity")] = polarity
+            df.iloc[idx, df.columns.get_loc("Subjectivity")] = subjectivity
+            df.iloc[idx, df.columns.get_loc("Score")] = classify_score(
+                polarity, pos_threshold, neg_threshold
             )
         except Exception as exc:
-            polarity, subjectivity, label = np.nan, np.nan, "Neutral"
-            error_message = (error_message + " | " if error_message else "") + (
-                f"Sentiment analysis failed: {exc}"
+            df.iloc[idx, df.columns.get_loc("Score")] = "neutral"
+            prev = df["error"].iloc[idx]
+            df.iloc[idx, df.columns.get_loc("error")] = (
+                (prev + " | " if prev else "") + f"Sentiment failed: {exc}"
             )
 
-        records.append(
-            {
-                "headline": headline,
-                "published": published,
-                "sentiment": label,
-                "polarity": polarity,
-                "subjectivity": subjectivity,
-                "story_text": story_text,
-                "used_fallback": used_fallback,
-                "error": error_message,
-            }
-        )
+        df.iloc[idx, df.columns.get_loc("storyText")] = plain_text
 
         if progress_callback is not None:
-            progress_callback((i + 1) / max(total, 1), f"Analyzed {i + 1} of {total} articles")
+            progress_callback((idx + 1) / max(total, 1), f"Analyzed {idx + 1}/{total}")
+        if idx < total - 1:
+            time.sleep(STORY_REQUEST_DELAY_SECONDS)  # pace API requests
 
-        # Gentle pacing between story requests to reduce API bursts.
-        if i < total - 1:
-            time.sleep(STORY_REQUEST_DELAY_SECONDS)
-
-    return pd.DataFrame.from_records(records)
+    return df
 
 
 # ---------------------------------------------------------------------------
-# Input validation
+# Step 4 — price impact (article's In [5]–[8]), optional
+# ---------------------------------------------------------------------------
+
+def add_price_impact(df: pd.DataFrame, ric: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Compute % returns at t+2/5/10/30 minutes after each news item and
+    aggregate mean returns per Score bucket, mirroring the article's
+    price-impact section. Uses ld.get_history for minute CLOSE bars.
+
+    News outside market hours simply gets NaN returns (as in the article,
+    those items are effectively discarded from the aggregation).
+
+    Args:
+        df: Scored dataframe with 'versionCreated' and 'Score'.
+        ric: Instrument RIC, e.g. 'GS.N'.
+
+    Returns:
+        Tuple of (dataframe with twoM/fiveM/tenM/thirtyM columns,
+        grouped mean dataframe by Score).
+
+    Raises:
+        RuntimeError: If minute price history cannot be retrieved.
+    """
+    ensure_session_open()
+
+    start = pd.to_datetime(df["versionCreated"].min()).strftime("%Y-%m-%d")
+    end = (
+        pd.to_datetime(df["versionCreated"].max()) + pd.Timedelta(days=1)
+    ).strftime("%Y-%m-%d")
+
+    try:
+        minute = ld.get_history(
+            universe=ric,
+            fields=["TRDPRC_1"],
+            interval="minute",
+            start=start,
+            end=end,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Failed to retrieve minute bars for '{ric}': {exc}") from exc
+
+    if minute is None or len(minute) == 0:
+        raise RuntimeError(f"No minute price history returned for '{ric}'.")
+
+    close = minute.iloc[:, 0]
+    close.index = pd.to_datetime(close.index).tz_localize(None)
+
+    df = df.copy()
+    for col, _ in RETURN_HORIZONS_MIN:
+        df[col] = np.nan
+
+    for idx, news_date in enumerate(df["versionCreated"].values):
+        s_time = pd.to_datetime(news_date)
+        if s_time.tzinfo is not None:
+            s_time = s_time.tz_convert(None) if s_time.tz is not None else s_time
+        s_time = s_time.replace(second=0, microsecond=0, tzinfo=None)
+        try:
+            t0 = close.loc[s_time]
+            for col, minutes in RETURN_HORIZONS_MIN:
+                t_n = close.loc[s_time + datetime.timedelta(minutes=minutes)]
+                df.iloc[idx, df.columns.get_loc(col)] = (t_n / t0 - 1) * 100
+        except (KeyError, Exception):
+            # Outside market hours or missing bar — skip, as in the article.
+            pass
+
+    grouped = (
+        df.groupby("Score")[["Polarity", "Subjectivity"] + [c for c, _ in RETURN_HORIZONS_MIN]]
+        .mean()
+        .reindex(SCORE_ORDER)
+    )
+    return df, grouped
+
+
+# ---------------------------------------------------------------------------
+# Validation
 # ---------------------------------------------------------------------------
 
 def validate_inputs(
     query: str,
     start_date: date,
     end_date: date,
-    max_headlines: int,
-    positive_threshold: float,
-    negative_threshold: float,
+    count: int,
+    pos_threshold: float,
+    neg_threshold: float,
 ) -> list[str]:
     """
-    Validate user inputs and return a list of human-readable error messages.
-
-    Args:
-        query: The LSEG news query string.
-        start_date: Analysis start date.
-        end_date: Analysis end date.
-        max_headlines: Maximum number of headlines to retrieve.
-        positive_threshold: Positive sentiment threshold.
-        negative_threshold: Negative sentiment threshold.
+    Validate user inputs.
 
     Returns:
-        A list of error messages; empty when all inputs are valid.
+        A list of error messages; empty when valid.
     """
     errors: list[str] = []
     if not query or not query.strip():
@@ -390,202 +389,126 @@ def validate_inputs(
         errors.append("The start date must be on or before the end date.")
     if end_date > date.today():
         errors.append("The end date cannot be in the future.")
-    if not (1 <= max_headlines <= MAX_HEADLINES_LIMIT):
+    if not (1 <= count <= MAX_HEADLINES_LIMIT):
         errors.append(f"Max headlines must be between 1 and {MAX_HEADLINES_LIMIT}.")
-    if negative_threshold >= positive_threshold:
-        errors.append(
-            "The negative threshold must be strictly below the positive threshold."
-        )
+    if neg_threshold >= pos_threshold:
+        errors.append("The negative threshold must be strictly below the positive one.")
     return errors
 
 
 # ---------------------------------------------------------------------------
-# Charts
-# ---------------------------------------------------------------------------
-
-def build_distribution_chart(results: pd.DataFrame) -> Any:
-    """
-    Build a bar chart of the sentiment class distribution.
-
-    Args:
-        results: The full results DataFrame.
-
-    Returns:
-        A Plotly figure.
-    """
-    counts = (
-        results["sentiment"]
-        .value_counts()
-        .reindex(SENTIMENT_ORDER, fill_value=0)
-        .rename_axis("Sentiment")
-        .reset_index(name="Articles")
-    )
-    fig = px.bar(
-        counts,
-        x="Sentiment",
-        y="Articles",
-        color="Sentiment",
-        color_discrete_map=SENTIMENT_COLORS,
-        title="Sentiment Distribution",
-    )
-    fig.update_layout(showlegend=False)
-    return fig
-
-
-def build_time_series_chart(results: pd.DataFrame) -> Any:
-    """
-    Build a line chart of average polarity by publication date.
-
-    Args:
-        results: The full results DataFrame.
-
-    Returns:
-        A Plotly figure.
-    """
-    ts = results.dropna(subset=["published", "polarity"]).copy()
-    ts["pub_date"] = pd.to_datetime(ts["published"], utc=True).dt.date
-    daily = ts.groupby("pub_date", as_index=False)["polarity"].mean()
-    fig = px.line(
-        daily,
-        x="pub_date",
-        y="polarity",
-        markers=True,
-        title="Average Sentiment (Polarity) Over Time",
-        labels={"pub_date": "Date", "polarity": "Average polarity"},
-    )
-    fig.add_hline(y=0.0, line_dash="dash", line_color="gray")
-    return fig
-
-
-# ---------------------------------------------------------------------------
-# Streamlit UI
+# UI
 # ---------------------------------------------------------------------------
 
 def render_sidebar() -> dict[str, Any]:
-    """
-    Render sidebar inputs and return the collected parameter values.
-
-    Returns:
-        Dict with keys: ``company``, ``query``, ``start_date``, ``end_date``,
-        ``max_headlines``, ``positive_threshold``, ``negative_threshold``,
-        ``run_clicked``.
-    """
+    """Render sidebar inputs and return their values."""
     st.sidebar.header("Analysis Parameters")
 
     company = st.sidebar.text_input("Company name", value="Goldman Sachs")
-    default_query = f'"{company}" and Language:LEN' if company.strip() else ""
+    ric = st.sidebar.text_input(
+        "RIC (for query and price impact)", value="GS.N",
+        help="Used to build the default article-style query R:<RIC> AND Language:LEN",
+    )
+    default_query = f"R:{ric} AND Language:LEN" if ric.strip() else ""
     query = st.sidebar.text_input(
-        "LSEG news query",
-        value=default_query,
-        help='Example: "Goldman Sachs" and Language:LEN — or use RIC syntax like GS.N',
+        "LSEG news query", value=default_query,
+        help="Article-style query, e.g. R:GS.N AND Language:LEN",
     )
 
     today = date.today()
     start_date = st.sidebar.date_input("Start date", value=today - timedelta(days=7))
     end_date = st.sidebar.date_input("End date", value=today)
+    count = st.sidebar.slider("Max headlines", 1, MAX_HEADLINES_LIMIT, 100)
 
-    max_headlines = st.sidebar.slider(
-        "Max headlines", min_value=1, max_value=MAX_HEADLINES_LIMIT, value=25
-    )
+    st.sidebar.subheader("Score thresholds (article default: ±0.05)")
+    pos_threshold = st.sidebar.slider("Positive if polarity ≥", 0.0, 1.0, 0.05, 0.01)
+    neg_threshold = st.sidebar.slider("Negative if polarity ≤", -1.0, 0.0, -0.05, 0.01)
 
-    st.sidebar.subheader("Sentiment thresholds")
-    positive_threshold = st.sidebar.slider(
-        "Positive threshold (polarity ≥)", 0.0, 1.0, 0.10, 0.01
+    do_price_impact = st.sidebar.checkbox(
+        "Compute price impact (t+2/5/10/30 min returns)", value=True
     )
-    negative_threshold = st.sidebar.slider(
-        "Negative threshold (polarity ≤)", -1.0, 0.0, -0.10, 0.01
-    )
-
     run_clicked = st.sidebar.button("Run analysis", type="primary", use_container_width=True)
 
     return {
         "company": company,
+        "ric": ric.strip(),
         "query": query,
         "start_date": start_date,
         "end_date": end_date,
-        "max_headlines": int(max_headlines),
-        "positive_threshold": float(positive_threshold),
-        "negative_threshold": float(negative_threshold),
+        "count": int(count),
+        "pos_threshold": float(pos_threshold),
+        "neg_threshold": float(neg_threshold),
+        "do_price_impact": bool(do_price_impact),
         "run_clicked": bool(run_clicked),
     }
 
 
-def render_metrics(results: pd.DataFrame) -> None:
-    """
-    Render summary metric tiles for the results.
-
-    Args:
-        results: The full results DataFrame.
-    """
-    total = len(results)
-    avg_polarity = float(results["polarity"].mean()) if total else 0.0
-    counts = results["sentiment"].value_counts()
-
+def render_metrics(df: pd.DataFrame) -> None:
+    """Render summary metric tiles."""
+    counts = df["Score"].value_counts()
     c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Total articles", total)
-    c2.metric("Average polarity", f"{avg_polarity:+.3f}")
-    c3.metric("Positive", int(counts.get("Positive", 0)))
-    c4.metric("Neutral", int(counts.get("Neutral", 0)))
-    c5.metric("Negative", int(counts.get("Negative", 0)))
+    c1.metric("Total articles", len(df))
+    c2.metric("Average polarity", f"{float(df['Polarity'].mean()):+.3f}")
+    c3.metric("Positive", int(counts.get("positive", 0)))
+    c4.metric("Neutral", int(counts.get("neutral", 0)))
+    c5.metric("Negative", int(counts.get("negative", 0)))
 
 
-def render_results_table(results: pd.DataFrame) -> None:
-    """
-    Render a searchable, sentiment-filterable article table.
+def render_charts(df: pd.DataFrame) -> None:
+    """Render distribution and time-series charts."""
+    col1, col2 = st.columns(2)
+    with col1:
+        counts = (
+            df["Score"].value_counts().reindex(SCORE_ORDER, fill_value=0)
+            .rename_axis("Score").reset_index(name="Articles")
+        )
+        fig = px.bar(
+            counts, x="Score", y="Articles", color="Score",
+            color_discrete_map=SCORE_COLORS, title="Sentiment Distribution",
+        )
+        fig.update_layout(showlegend=False)
+        st.plotly_chart(fig, use_container_width=True)
+    with col2:
+        ts = df.dropna(subset=["versionCreated", "Polarity"]).copy()
+        ts["pub_date"] = pd.to_datetime(ts["versionCreated"], utc=True).dt.date
+        daily = ts.groupby("pub_date", as_index=False)["Polarity"].mean()
+        fig2 = px.line(
+            daily, x="pub_date", y="Polarity", markers=True,
+            title="Average Polarity Over Time",
+            labels={"pub_date": "Date", "Polarity": "Average polarity"},
+        )
+        fig2.add_hline(y=0.0, line_dash="dash", line_color="gray")
+        st.plotly_chart(fig2, use_container_width=True)
 
-    Args:
-        results: The full results DataFrame.
-    """
+
+def render_table(df: pd.DataFrame) -> None:
+    """Render the searchable, filterable article table."""
     st.subheader("Articles")
-
     fcol1, fcol2 = st.columns([1, 2])
     with fcol1:
-        selected_sentiments = st.multiselect(
-            "Filter by sentiment",
-            options=SENTIMENT_ORDER,
-            default=SENTIMENT_ORDER,
-        )
+        selected = st.multiselect("Filter by score", SCORE_ORDER, default=SCORE_ORDER)
     with fcol2:
-        search_term = st.text_input(
-            "Search headlines and story text", value="", placeholder="e.g. earnings"
-        )
+        needle = st.text_input("Search headlines and story text", "")
 
-    filtered = results[results["sentiment"].isin(selected_sentiments)]
-    if search_term.strip():
-        needle = search_term.strip().lower()
-        mask = filtered["headline"].str.lower().str.contains(needle, na=False) | filtered[
-            "story_text"
-        ].str.lower().str.contains(needle, na=False)
+    filtered = df[df["Score"].isin(selected)]
+    if needle.strip():
+        n = needle.strip().lower()
+        mask = (
+            filtered["text"].str.lower().str.contains(n, na=False)
+            | filtered["storyText"].str.lower().str.contains(n, na=False)
+        )
         filtered = filtered[mask]
 
-    st.caption(f"Showing {len(filtered)} of {len(results)} articles.")
-
-    display_df = filtered.rename(
+    st.caption(f"Showing {len(filtered)} of {len(df)} articles.")
+    display = filtered.rename(
         columns={
-            "headline": "Headline",
-            "published": "Publication date",
-            "sentiment": "Sentiment",
-            "polarity": "Polarity",
-            "subjectivity": "Subjectivity",
-            "story_text": "Story text",
-            "error": "Retrieval error",
+            "text": "Headline", "versionCreated": "Publication date",
+            "Score": "Sentiment", "storyText": "Story text", "error": "Retrieval error",
         }
-    )[
-        [
-            "Headline",
-            "Publication date",
-            "Sentiment",
-            "Polarity",
-            "Subjectivity",
-            "Story text",
-            "Retrieval error",
-        ]
-    ]
-
+    )[["Headline", "Publication date", "Sentiment", "Polarity",
+       "Subjectivity", "Story text", "Retrieval error"]]
     st.dataframe(
-        display_df,
-        use_container_width=True,
-        hide_index=True,
+        display, use_container_width=True, hide_index=True,
         column_config={
             "Polarity": st.column_config.NumberColumn(format="%.3f"),
             "Subjectivity": st.column_config.NumberColumn(format="%.3f"),
@@ -595,113 +518,86 @@ def render_results_table(results: pd.DataFrame) -> None:
 
 
 def main() -> None:
-    """Application entry point: render the UI and orchestrate the pipeline."""
-    st.set_page_config(
-        page_title="LSEG News Sentiment Analysis",
-        page_icon="📰",
-        layout="wide",
-    )
+    """Application entry point."""
+    st.set_page_config(page_title="LSEG News Sentiment Analysis", page_icon="📰", layout="wide")
     st.title("📰 LSEG News Sentiment Analysis")
     st.caption(
-        "Retrieves headlines and full stories from LSEG Workspace, then scores "
-        "sentiment with TextBlob. Requires a running LSEG Workspace desktop session."
+        "Article-style pipeline: get_headlines → get_story → BeautifulSoup → "
+        "TextBlob → Score buckets → optional price-impact aggregation."
     )
 
     if ld is None:
-        st.error(
-            "The 'lseg-data' package is not installed. "
-            "Run: pip install -r requirements.txt"
-        )
+        st.error("The 'lseg-data' package is not installed. Run: pip install -r requirements.txt")
         st.stop()
 
     params = render_sidebar()
-
-    if "results" not in st.session_state:
-        st.session_state["results"] = None
-    if "last_run_meta" not in st.session_state:
-        st.session_state["last_run_meta"] = None
+    st.session_state.setdefault("df", None)
+    st.session_state.setdefault("grouped", None)
 
     if params["run_clicked"]:
         errors = validate_inputs(
-            query=params["query"],
-            start_date=params["start_date"],
-            end_date=params["end_date"],
-            max_headlines=params["max_headlines"],
-            positive_threshold=params["positive_threshold"],
-            negative_threshold=params["negative_threshold"],
+            params["query"], params["start_date"], params["end_date"],
+            params["count"], params["pos_threshold"], params["neg_threshold"],
         )
         if errors:
             for message in errors:
                 st.error(message)
         else:
             try:
-                headlines = fetch_headlines(
-                    query=params["query"].strip(),
-                    start_date_iso=params["start_date"].isoformat(),
-                    end_date_iso=params["end_date"].isoformat(),
-                    max_headlines=params["max_headlines"],
+                df = get_headlines_df(
+                    params["query"].strip(),
+                    params["start_date"].isoformat(),
+                    params["end_date"].isoformat(),
+                    params["count"],
                 )
             except RuntimeError as exc:
                 st.error(str(exc))
-                headlines = None
+                df = None
 
-            if headlines is not None:
-                if headlines.empty:
-                    st.warning(
-                        "No headlines were found for this query and date range. "
-                        "Try broadening the query or widening the dates."
-                    )
+            if df is not None:
+                if df.empty:
+                    st.warning("No headlines found. Broaden the query or widen the dates.")
                 else:
-                    progress = st.progress(0.0, text="Starting analysis...")
-
-                    def _update(fraction: float, message: str) -> None:
-                        progress.progress(min(fraction, 1.0), text=message)
-
-                    results = run_sentiment_analysis(
-                        headlines_df=headlines,
-                        positive_threshold=params["positive_threshold"],
-                        negative_threshold=params["negative_threshold"],
-                        progress_callback=_update,
+                    progress = st.progress(0.0, text="Scoring sentiment...")
+                    df = score_sentiment(
+                        df, params["pos_threshold"], params["neg_threshold"],
+                        lambda f, m: progress.progress(min(f, 1.0), text=m),
                     )
                     progress.empty()
 
-                    st.session_state["results"] = results
-                    st.session_state["last_run_meta"] = {
-                        "query": params["query"].strip(),
-                        "start": params["start_date"].isoformat(),
-                        "end": params["end_date"].isoformat(),
-                        "run_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    }
+                    grouped = None
+                    if params["do_price_impact"] and params["ric"]:
+                        try:
+                            with st.spinner("Computing price impact..."):
+                                df, grouped = add_price_impact(df, params["ric"])
+                        except RuntimeError as exc:
+                            st.warning(f"Price impact skipped: {exc}")
 
-    results: Optional[pd.DataFrame] = st.session_state.get("results")
+                    st.session_state["df"] = df
+                    st.session_state["grouped"] = grouped
 
-    if results is None or results.empty:
+    df: Optional[pd.DataFrame] = st.session_state.get("df")
+    if df is None or df.empty:
         st.info("Configure the parameters in the sidebar and click **Run analysis**.")
         return
 
-    meta = st.session_state.get("last_run_meta") or {}
-    if meta:
+    failures = int((df["error"] != "").sum())
+    if failures:
+        st.warning(f"{failures} article(s) had retrieval issues; headline text was used as fallback.")
+
+    render_metrics(df)
+    render_charts(df)
+
+    grouped: Optional[pd.DataFrame] = st.session_state.get("grouped")
+    if grouped is not None:
+        st.subheader("Mean returns after news, by Score bucket (%)")
         st.caption(
-            f"Query: `{meta.get('query', '')}` · Range: {meta.get('start', '')} → "
-            f"{meta.get('end', '')} · Last run: {meta.get('run_at', '')}"
+            "Average t+2/5/10/30-minute returns per sentiment bucket. News "
+            "outside market hours is excluded, as in the reference article."
         )
+        st.dataframe(grouped.style.format("{:.4f}"), use_container_width=True)
 
-    fallback_count = int(results["used_fallback"].sum())
-    if fallback_count:
-        st.warning(
-            f"{fallback_count} article(s) could not be fully retrieved; the headline "
-            "text was used as a fallback for sentiment scoring."
-        )
-
-    render_metrics(results)
-
-    chart_col1, chart_col2 = st.columns(2)
-    with chart_col1:
-        st.plotly_chart(build_distribution_chart(results), use_container_width=True)
-    with chart_col2:
-        st.plotly_chart(build_time_series_chart(results), use_container_width=True)
-
-    render_results_table(results)
+    render_table(df)
 
 
 if __name__ == "__main__":
