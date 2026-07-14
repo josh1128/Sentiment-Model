@@ -1,0 +1,8 @@
+streamlit
+lseg-data
+pandas
+numpy
+plotly
+beautifulsoup4
+lxml
+textblob
